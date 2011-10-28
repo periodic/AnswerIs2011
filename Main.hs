@@ -4,11 +4,17 @@ import Answer
 import System.Environment
 import Control.Concurrent
 import GHC.Conc (numCapabilities)
+import Control.Monad
+import System.IO
 
 
 {- | The list of expressions to check.
  -}
-dataSource = enumerate 3 4
+dataSource = enumerate 4 3
+
+{- | Size of chunks per thread.
+ -}
+chunkSize = 4096
 
 main = do
     [targArg] <- getArgs
@@ -20,35 +26,43 @@ main = do
 {- | An attempt at an overly complicated multi-threaded solution.
  -}
 parMain target = do
-
-    dataVar <- newEmptyMVar   :: IO (MVar [Expression])
-    outputVar <- newEmptyMVar :: IO (MVar Expression)
-    doneVar <- newEmptyMVar   :: IO (MVar ())
-
     putStrLn $ "Preparing to run on " ++ show numCapabilities ++ " cores."
 
-    processThreads <- sequence . replicate numCapabilities . forkIO $ processor outputVar dataVar target
-    printerThread  <- forkIO $ printer outputVar
-    providerThread <- forkIO $ provider dataVar doneVar dataSource
+    dataVar <- newEmptyMVar   :: IO (MVar [Expression])
+    outputVar <- newEmptyMVar :: IO (MVar (Maybe Expression))
+    threadVars <- replicateM numCapabilities newEmptyMVar :: IO [MVar ()]
 
-    takeMVar doneVar
+    processThreads <- mapM (forkIO . processor target outputVar dataVar) threadVars
+    printerThread  <- forkIO $ printer outputVar
+    providerThread <- forkIO $ provider dataVar dataSource
+
+    mapM_ takeMVar threadVars
+    putMVar outputVar Nothing
 
     where
-        provider :: MVar [Expression] -> MVar () -> [Expression] -> IO ()
-        provider dataVar doneVar list = do
-            let (chunk, rest) = splitAt 1024 list
-            case chunk of
-                [] -> putMVar doneVar ()
-                ds -> putMVar dataVar ds >> provider dataVar doneVar rest
+        provider :: MVar [Expression] -> [Expression] -> IO ()
+        provider dataVar list = do
+            let (chunk, rest) = splitAt chunkSize list
+            putMVar dataVar chunk
+            unless (chunk == []) $ provider dataVar rest
 
-        printer :: MVar Expression -> IO ()
-        printer outputVar = takeMVar outputVar >>= print >> printer outputVar
+        printer :: MVar (Maybe Expression) -> IO ()
+        printer outputVar = do
+            mExp <- takeMVar outputVar 
+            case mExp of
+                Just e  -> print e >> printer outputVar
+                Nothing -> return ()
 
-        processor :: MVar Expression -> MVar [Expression] -> Double -> IO ()
-        processor outputVar dataVar target = do
+        processor :: Double -> MVar (Maybe Expression) -> MVar [Expression] -> MVar () -> IO ()
+        processor target outputVar dataVar threadVar = do
             datums <- takeMVar dataVar
-            sequence . map (putMVar outputVar) . filter (maybe False (==target) . eval) $ datums
-            processor outputVar dataVar target
+            case datums of
+                [] -> putMVar dataVar [] >> putMVar threadVar ()
+                ds -> do
+                    mapM (putMVar outputVar. Just) . filter (maybe False (==target) . eval) $ ds
+                    putStr "."
+                    hFlush stdout
+                    processor target outputVar dataVar threadVar
 
 
 

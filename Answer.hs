@@ -64,7 +64,9 @@ evalST (Num)  = liftM fromIntegral $ get <* modify (+1)
  -}
 eval :: Expression -> Maybe Double
 eval e = case evalState (runMaybeT . runEval . evalST $ e) 1 of
-    Just a -> if (isNaN a || isInfinite a) then Nothing else Just a
+    Just a -> if isNaN a || isInfinite a
+              then Nothing
+              else Just a
     a      -> a
 
 {- | The enumeration monad.  This is almost a state monad, but each element has
@@ -84,12 +86,12 @@ instance Monad (Enumerate st) where
     m >>= k  = Gen $ \st ->
                 let vals = generate m st
                  in concatMap (\(v,st) -> generate (k v) st) vals
-    fail _ = Gen $ \st -> []
+    fail _   = Gen $ \_ -> []
 
 {- | In any specific instance we can get and put the state. -}
 instance MonadState st (Enumerate st) where
-    get = Gen $ \st -> [(st, st)]
-    put st = Gen $ \st' -> [((), st)]
+    get    = Gen $ \st -> [(st, st)]
+    put st = Gen $ \_  -> [((), st)]
 
 {- | Monad plus instance for the use of msum and guard. -}
 instance MonadPlus (Enumerate st) where
