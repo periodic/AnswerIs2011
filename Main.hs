@@ -6,14 +6,20 @@ import Control.Concurrent
 import GHC.Conc (numCapabilities)
 
 
+{- | The list of expressions to check.
+ -}
 dataSource = enumerate 3 4
 
-main = parMain
-
-parMain = do
+main = do
     [targArg] <- getArgs
 
     let target = read targArg :: Double
+
+    parMain target
+
+{- | An attempt at an overly complicated multi-threaded solution.
+ -}
+parMain target = do
 
     dataVar <- newEmptyMVar   :: IO (MVar [Expression])
     outputVar <- newEmptyMVar :: IO (MVar Expression)

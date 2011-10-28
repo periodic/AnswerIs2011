@@ -1,14 +1,15 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving, FlexibleInstances, MultiParamTypeClasses #-}
 module Answer where
 
 import Data.Maybe
-
 import Control.Monad
 import Control.Monad.Trans.Maybe
 import Control.Monad.State
-
+import Control.Applicative
 import Statistics.Math (factorial)
 
+{- | The expression data structure.  Note that we don't specify the numbers because they are always the sequential natural numbers in the order they appear in the expression from left to right.
+ -}
 data Expression = Add Expression Expression
                 | Sub Expression Expression
                 | Mul Expression Expression
@@ -22,6 +23,8 @@ data Expression = Add Expression Expression
 instance Show Expression where
     show e = fst $ runState (showST e) 1
 
+{- | Print out an expression.  Handles all the managing of state to make sure the numbers work out.
+ -}
 showST :: Expression -> State Int String
 showST (Add a b) = liftM2 (\a b -> "(" ++ a ++ "+" ++ b ++ ")") (showST a) (showST b)
 showST (Sub a b) = liftM2 (\a b -> "(" ++ a ++ "-" ++ b ++ ")") (showST a) (showST b)
@@ -35,49 +38,89 @@ showST (Num)  = do
     put (n+1)
     return . show $ n
 
+{- | The evaluation monad.  This needs to keep track of failure (such as divide
+ - by zero or sqrt of a negative number) which is handled by MaybeT, and the
+ - state to keep track of how many numbers have been seen so far so we can get
+ - the correct number whenever we encounter one.
+ -}
 newtype Eval a = E {
     runEval :: MaybeT (State Int) a
-} deriving (Monad, MonadState Int)
+} deriving (Monad, MonadState Int, MonadPlus, Functor, Applicative)
 
 evalST :: Expression -> Eval Double
 evalST (Add a b) = liftM2 (+) (evalST a) (evalST b)
 evalST (Sub a b) = liftM2 (-) (evalST a) (evalST b)
 evalST (Mul a b) = liftM2 (*) (evalST a) (evalST b)
-evalST (Div a b) = do
-    denom <- evalST b
-    if denom == 0
-        then fail "Divide by zero."
-        else liftM (/ denom) (evalST a)
+evalST (Div a b) = liftM2 (/) (evalST a) (evalST b)
 evalST (Pow a b) = liftM2 (**) (evalST a) (evalST b)
 evalST (Fact e)  = do
     base <- evalST e
-    if base /= (fromIntegral . truncate $ base)
-        then fail "Factorial of non-integer."
-        else if base < 0 || base > 20
-            then fail "Factorial too small or too large."
-            else return . factorial . truncate $ base
+    guard (base == (fromIntegral . truncate $ base) && base > 0 && base < 20)
+    return . factorial . truncate $ base
 evalST (Sqrt e)  = liftM sqrt (evalST e)
-evalST (Num)  = do
-    n <- get
-    put (n+1)
-    return . fromIntegral $ n
+evalST (Num)  = liftM fromIntegral $ get <* modify (+1)
 
-
+{- | A wrapper to run the evaluation monad on an expression.
+ -}
 eval :: Expression -> Maybe Double
 eval e = case evalState (runMaybeT . runEval . evalST $ e) 1 of
-    Just a -> if (isNaN a) then Nothing else Just a
+    Just a -> if (isNaN a || isInfinite a) then Nothing else Just a
     a      -> a
 
-enumerate :: Int -> Int -> [Expression]
-enumerate unary binary = map (\(a, b, c) -> a) $ generate unary binary
+{- | The enumeration monad.  This is almost a state monad, but each element has
+ - its own state.  This requires some slightly odd mechanics and limits our
+ - ability to use newtype deriving.
+ -}
+newtype Enumerate st a = Gen {
+        generate :: st -> [(a, st)]
+    }
 
-generate :: Int -> Int -> [(Expression, Int, Int)]
-generate u b = (Num, u, b) : facts u b ++ adds u b
+{- | When composing monads this works a lot like the list monad, but it has to
+ - pass the state as well.  I'm not sure if this could be represented by some
+ - combination of monad transformers.
+ -}
+instance Monad (Enumerate st) where
+    return a = Gen $ \st -> [(a, st)]
+    m >>= k  = Gen $ \st ->
+                let vals = generate m st
+                 in concatMap (\(v,st) -> generate (k v) st) vals
+    fail _ = Gen $ \st -> []
+
+{- | In any specific instance we can get and put the state. -}
+instance MonadState st (Enumerate st) where
+    get = Gen $ \st -> [(st, st)]
+    put st = Gen $ \st' -> [((), st)]
+
+{- | Monad plus instance for the use of msum and guard. -}
+instance MonadPlus (Enumerate st) where
+    mplus a b = Gen $ \st -> generate a st ++ generate b st
+    mzero     = fail ""
+
+{- | A short-hand for returning no values.
+ -}
+noVals :: Enumerate st a
+noVals = fail ""
+
+{- | The actual generator expression.  It tracks the number of unary and binary
+ - expressions still available for use as it builds up an expression.
+ -}
+genExp :: Enumerate (Int, Int) Expression
+genExp = msum $ num : map unary [Fact, Sqrt] ++ map binary [Add, Sub, Mul, Div, Pow]
     where
-        facts u b | u == 0    = []
-                  | otherwise = concatMap (mapUnary u b) [Fact, Sqrt]
-        adds  u b | b == 0    = []
-                  | otherwise = concatMap (mapBinary u b) [Add, Sub, Mul, Div, Pow]
-        mapUnary  u b unary   = map (\(e, u, b) -> (unary e, u, b)) (generate (u - 1) b)
-        mapBinary u b binary  = concatMap (\(e1, u1, b1) -> map (\(e2, u2, b2) -> (binary e1 e2, u2, b2)) (generate u1 b1)) (generate u (b-1))
+        num       = return Num
+        unary cst = do
+            (b, u) <- get
+            guard (u > 0)
+            put (b, u - 1)
+            liftM cst genExp
+        binary cst = do
+            (b, u) <- get
+            guard (b > 0)
+            put (b - 1, u)
+            liftM2 cst genExp genExp
 
+{- | A wrapper for the generator.  Takes the maximum number of binary and unary
+ - expressions to use.
+ -}
+enumerate :: Int -> Int -> [Expression]
+enumerate binary unary = map fst . generate genExp $ (binary,unary)
